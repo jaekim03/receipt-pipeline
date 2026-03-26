@@ -3,7 +3,7 @@ import psycopg2
 from dotenv import load_dotenv
 
 load_dotenv()
-
+# Creates Database conncetion to postgresql server. 
 def get_connection():
     return psycopg2.connect(
         host="localhost",

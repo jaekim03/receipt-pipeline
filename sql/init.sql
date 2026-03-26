@@ -1,6 +1,6 @@
 CREATE TABLE IF NOT EXISTS receipt (
     id SERIAL PRIMARY KEY,
-    file_name VARCHAR(255),
+    file_name VARCHAR(255) UNIQUE,
     vendor VARCHAR(255),
     amount NUMERIC(10,2),
     currency VARCHAR(3),
