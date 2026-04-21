@@ -1,17 +1,17 @@
-import os 
+import os
 from db import get_connection
 
-files = os.listdir("data/raw")
+script_dir = os.path.dirname(os.path.abspath(__file__))
+raw_dir = os.path.join(script_dir, "..", "data", "raw")
+
+files = os.listdir(raw_dir)
 print(files)
 
 conn = get_connection()
-# What we use to execut the SQL statements 
-cur = conn.cursor() 
+cur = conn.cursor()
 
-# Loop through files and execute insert for each 
 for file in files:
-    # cur.execute(SQL Query, params)
-    cur.execute( 
+    cur.execute(
         "INSERT INTO receipt (file_name) VALUES (%s) ON CONFLICT DO NOTHING",
         (file,)
     )

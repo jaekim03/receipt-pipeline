@@ -1,0 +1,342 @@
+# Receipt Data Pipeline — Implementation Plan
+
+## Context
+
+First data engineering project for resume. Goal: build a Python pipeline that ingests 282 phone photos of receipts, extracts structured data (date, price, merchant) via OCR, stores metadata in PostgreSQL, and renames files for easy lookup. User is new to Docker and wants to learn each piece incrementally.
+
+## Tech Stack
+
+- Python 3.11 — pipeline logic
+- PostgreSQL 16 — metadata storage (in Docker)
+- Tesseract OCR — pre-trained text extraction (no model training)
+- OpenCV — image preprocessing
+- Docker + docker-compose — infrastructure
+- File system — image storage (Docker volume), DB stores paths/metadata
+
+## Project Structure
+
+receipt-pipeline/
+├── docker-compose.yml
+├── Dockerfile
+├── requirements.txt
+├── .env                        # DB creds (gitignored)
+├── .gitignore
+├── data/
+│   ├── raw/                    # Original 282 photos (gitignored)
+│   ├── processed/              # Cleaned images for OCR
+│   └── renamed/                # Final renamed copies
+├── sql/
+│   └── init.sql                # Schema (auto-runs on first DB start)
+├── src/
+│   ├── __init__.py
+│   ├── db.py                   # DB connection factory
+│   ├── ingest.py               # Register images in DB
+│   ├── preprocess.py           # Grayscale, threshold, denoise
+│   ├── ocr.py                  # Tesseract text extraction
+│   ├── parse.py                # Regex extraction of date/price/merchant
+│   ├── store.py                # Summary report + SQL view
+│   └── rename.py               # Copy files with clean names
+├── scripts/
+│   └── run_pipeline.py         # Orchestrator
+└── tests/
+    └── test_parse.py           # Unit tests for regex logic
+
+## Database Schema (3 tables)
+
+### Table 1: receipts — source of truth for ingested files
+
+CREATE TABLE IF NOT EXISTS receipts (
+    id              SERIAL PRIMARY KEY,
+    original_filename TEXT NOT NULL UNIQUE,
+    file_extension  TEXT NOT NULL,
+    file_size_bytes INTEGER NOT NULL,
+    ingested_at     TIMESTAMP NOT NULL DEFAULT NOW()
+);
+
+### Table 2: processing_log — audit trail per pipeline stage
+
+CREATE TABLE IF NOT EXISTS processing_log (
+    id              SERIAL PRIMARY KEY,
+    receipt_id      INTEGER NOT NULL REFERENCES receipts(id),
+    stage           TEXT NOT NULL,           -- 'preprocess', 'ocr', 'parse', 'rename'
+    status          TEXT NOT NULL DEFAULT 'pending',  -- 'pending', 'success', 'failed'
+    error_message   TEXT,
+    started_at      TIMESTAMP,
+    completed_at    TIMESTAMP
+);
+
+CREATE INDEX idx_processing_log_receipt ON processing_log(receipt_id);
+CREATE INDEX idx_processing_log_stage_status ON processing_log(stage, status);
+
+### Table 3: extracted_data — structured output
+
+CREATE TABLE IF NOT EXISTS extracted_data (
+    id              SERIAL PRIMARY KEY,
+    receipt_id      INTEGER NOT NULL UNIQUE REFERENCES receipts(id),
+    raw_text        TEXT,
+    merchant        TEXT,
+    purchase_date   DATE,
+    total_amount    NUMERIC(10,2),
+    currency        TEXT DEFAULT 'USD',
+    confidence      TEXT,                    -- 'high', 'medium', 'low'
+    renamed_filename TEXT,
+    parsed_at       TIMESTAMP NOT NULL DEFAULT NOW()
+);
+
+CREATE INDEX idx_extracted_data_merchant ON extracted_data(merchant);
+CREATE INDEX idx_extracted_data_date ON extracted_data(purchase_date);
+
+## Docker Setup
+
+### docker-compose.yml
+
+version: "3.8"
+
+services:
+  db:
+    image: postgres:16-alpine
+    container_name: receipt_db
+    environment:
+      POSTGRES_USER: ${POSTGRES_USER}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD}
+      POSTGRES_DB: ${POSTGRES_DB}
+    ports:
+      - "5432:5432"
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+      - ./sql/init.sql:/docker-entrypoint-initdb.d/init.sql
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER} -d ${POSTGRES_DB}"]
+      interval: 5s
+      timeout: 5s
+      retries: 5
+
+  app:
+    build: .
+    container_name: receipt_app
+    depends_on:
+      db:
+        condition: service_healthy
+    environment:
+      DB_HOST: db
+      DB_PORT: 5432
+      DB_USER: ${POSTGRES_USER}
+      DB_PASSWORD: ${POSTGRES_PASSWORD}
+      DB_NAME: ${POSTGRES_DB}
+    volumes:
+      - ./data:/app/data
+      - ./src:/app/src
+      - ./scripts:/app/scripts
+
+volumes:
+  pgdata:
+
+### Dockerfile
+
+FROM python:3.11-slim
+
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    tesseract-ocr \
+    libgl1 \
+    libglib2.0-0 \
+    && rm -rf /var/lib/apt/lists/*
+
+WORKDIR /app
+
+COPY requirements.txt .
+RUN pip install --no-cache-dir -r requirements.txt
+
+COPY src/ ./src/
+COPY scripts/ ./scripts/
+
+CMD ["python", "scripts/run_pipeline.py"]
+
+### .env
+
+POSTGRES_USER=receipt_user
+POSTGRES_PASSWORD=receipt_pass
+POSTGRES_DB=receipt_db
+
+### requirements.txt
+
+psycopg2-binary==2.9.9
+Pillow==10.4.0
+pytesseract==0.3.13
+opencv-python-headless==4.10.0.84
+python-dotenv==1.0.1
+
+## Build Order (complete each phase before starting the next)
+
+=== PHASE 0: Docker Foundations ===
+
+Goal: Get comfortable with Docker. No Python yet.
+
+Steps:
+1. Install Docker Desktop
+2. Create only docker-compose.yml, .env, and sql/init.sql
+3. Run: docker-compose up db (just the database)
+4. In another terminal, connect: docker exec -it receipt_db psql -U receipt_user -d receipt_db
+5. Run \dt to confirm your three tables were created
+6. Insert a test row: INSERT INTO receipts (original_filename, file_extension, file_size_bytes) VALUES ('test.jpg', 'jpg', 1024);
+7. Query it: SELECT * FROM receipts;
+8. Run docker-compose down then docker-compose up db again — query again, data should persist
+9. Run docker volume ls to see the named volume
+
+Verify: \dt shows 3 tables, data survives docker-compose down + up
+
+=== PHASE 1: Ingest (src/db.py + src/ingest.py) ===
+
+Goal: Register your 282 images in the database.
+
+Build src/db.py first:
+- Single function returning a psycopg2 connection using environment variables
+- Use os.environ to read DB_HOST, DB_PORT, DB_USER, DB_PASSWORD, DB_NAME
+- This is the only place that knows how to connect to the DB
+
+Build src/ingest.py:
+- Scan data/raw/ for .jpg and .png files
+- For each: get filename, extension, file size
+- Insert into receipts with ON CONFLICT (original_filename) DO NOTHING (idempotent)
+- Print summary: "Ingested 282 receipts. 0 skipped."
+
+Run locally (not in Docker) with DB_HOST=localhost since port 5432 is exposed.
+
+Verify:
+  SELECT COUNT(*) FROM receipts;  -- Should be 282
+  Re-run script -- still 282
+
+=== PHASE 2: Preprocess (src/preprocess.py) ===
+
+Goal: Clean images for better OCR accuracy.
+
+For each image:
+1. Check processing_log — skip if already preprocessed successfully
+2. Load with cv2.imread()
+3. Convert to grayscale: cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
+4. Adaptive threshold: cv2.adaptiveThreshold(gray, 255, cv2.ADAPTIVE_THRESH_GAUSSIAN_C, cv2.THRESH_BINARY, 11, 2)
+5. Optional blur: cv2.GaussianBlur(thresh, (3,3), 0)
+6. Save to data/processed/
+7. Log success/failure in processing_log
+
+IMPORTANT: Never overwrite originals. data/raw/ is immutable.
+
+Verify:
+- Compare processed vs original visually
+- SELECT status, COUNT(*) FROM processing_log WHERE stage='preprocess' GROUP BY status;
+- Re-run: should say "0 images to preprocess"
+
+=== PHASE 3: OCR (src/ocr.py) ===
+
+Goal: Extract raw text from preprocessed images.
+
+For each image with preprocess=success but no ocr=success:
+1. Load processed image
+2. Run pytesseract.image_to_string(img)
+3. Insert raw text into extracted_data.raw_text
+4. Log in processing_log
+
+NOTE: Raw text will be messy. Do NOT parse here — separation of concerns.
+
+Verify:
+  SELECT r.original_filename, LEFT(e.raw_text, 100)
+  FROM extracted_data e JOIN receipts r ON r.id = e.receipt_id
+  LIMIT 5;
+  -- Should see recognizable words
+
+=== PHASE 4: Parse (src/parse.py) ===
+
+Goal: Extract merchant, date, total from raw text using regex.
+
+Three functions:
+
+extract_total(text):
+  - Pattern: r'(?:total|amount\s*due|balance\s*due)[:\s]*\$?([\d]+\.[\d]{2})' (case insensitive)
+  - If multiple matches, take the largest
+
+extract_date(text):
+  - Look for: 01/15/2024, 2024-01-15, Jan 15 2024, January 15, 2024
+  - Try multiple regex patterns
+
+extract_merchant(text):
+  - Heuristic: first non-empty line longer than 3 chars that isn't a date or number
+
+Confidence scoring:
+  - high = all 3 fields found
+  - medium = 2 of 3
+  - low = 0-1 of 3
+
+WRITE UNIT TESTS FIRST in tests/test_parse.py:
+  def test_extract_total_standard():
+      assert extract_total("SUBTOTAL  $8.50\nTAX  $0.68\nTOTAL  $9.18") == 9.18
+
+  def test_extract_total_no_dollar_sign():
+      assert extract_total("Total: 15.99") == 15.99
+
+Run tests: python -m pytest tests/
+
+Verify:
+  SELECT confidence, COUNT(*) FROM extracted_data GROUP BY confidence;
+
+=== PHASE 5: Store/Report (src/store.py) ===
+
+Goal: Summary views and analytical queries.
+
+Create SQL view:
+  CREATE OR REPLACE VIEW receipt_summary AS
+  SELECT r.original_filename, e.merchant, e.purchase_date,
+         e.total_amount, e.confidence, e.renamed_filename
+  FROM receipts r JOIN extracted_data e ON e.receipt_id = r.id
+  ORDER BY e.purchase_date DESC;
+
+Sample queries:
+  SELECT merchant, COUNT(*), SUM(total_amount)
+  FROM extracted_data WHERE confidence IN ('high', 'medium')
+  GROUP BY merchant ORDER BY COUNT(*) DESC LIMIT 10;
+
+=== PHASE 6: Rename (src/rename.py) ===
+
+Goal: Copy files to data/renamed/ with descriptive names.
+
+Format: YYYY-MM-DD_merchant_amount.jpg
+- Sanitize merchant: lowercase, spaces → underscores, strip special chars
+- Missing fields: use "unknown-date", "unknown-merchant"
+- Duplicates: append _1, _2, etc.
+- COPY, never move. Originals stay in data/raw/
+- Write renamed_filename back to extracted_data
+
+Verify:
+  ls data/renamed/ | head -20
+  -- Should show: 2024-03-15_walmart_42.87.jpg
+
+=== PHASE 7: Dockerize the App ===
+
+Goal: Full pipeline runs via docker-compose up.
+
+1. Create Dockerfile (see Docker Setup section above)
+2. Add app service to docker-compose.yml
+3. Create scripts/run_pipeline.py orchestrator:
+   - Calls run_ingest(), run_preprocess(), run_ocr(), run_parse(), run_store(), run_rename() in order
+   - Each function checks processing_log, so re-runs are safe
+
+Verify:
+  docker-compose down -v && docker-compose up
+  -- Should process all 282 from scratch
+
+## End-to-End Verification Checklist
+
+1. docker-compose down -v && docker-compose up — full rebuild
+2. SELECT COUNT(*) FROM receipts; — should be 282
+3. SELECT stage, status, COUNT(*) FROM processing_log GROUP BY stage, status;
+4. Spot-check 5 random receipts against original photos
+5. Idempotency: run pipeline twice, second run processes 0 new items
+6. python -m pytest tests/ — parse unit tests pass
+
+## Resume-Worthy Patterns This Project Demonstrates
+
+- Idempotent, re-runnable pipeline (processing_log checks)
+- Audit trail / observability (processing_log table)
+- Data layer separation (raw -> processed -> renamed = bronze/silver/gold)
+- Docker-compose with health checks
+- Confidence scoring for data quality
+- Unit tests for parsing logic
+- Clean project structure with separation of concerns
